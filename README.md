@@ -2,6 +2,9 @@
 
 # Jev Ultrafast ⚡
 
+> [!NOTE]
+> **Fork:** runs the agent against a self-hosted Laya server instead of hosted TypeSafe Jev. See [FORK.md](FORK.md) for why and how.
+
 > [!IMPORTANT]
 > **The Browser Use Cloud waitlist is open.** Get early access to ultrafast browser agents in the cloud.
 > **[Join the waitlist →](https://browser-use.com/ultrafast?utm_source=github&utm_medium=readme&utm_campaign=jev-ultrafast)**

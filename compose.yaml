@@ -1,0 +1,31 @@
+# Self-hosted Jev-compatible server. The agent itself runs on the host (uv run jev), not in Docker.
+# why: the agent drives your real Chrome through Browser Harness (CDP); a container cannot reach that session.
+services:
+  laya-serve:
+    build:
+      context: ./laya
+      args:
+        TORCH_INDEX: "${LAYA_TORCH_INDEX:-cpu}"
+        TORCH_VERSION: "${LAYA_TORCH_VERSION:-2.14.0}"
+    entrypoint: ["laya-serve"]
+    command: []
+    environment:
+      LAYA_HOST: "0.0.0.0"
+      LAYA_PORT: "8000"
+      # why: Docker on macOS runs in a Linux VM with no MPS access, so CPU is the only option here.
+      LAYA_DEVICE: "cpu"
+      LAYA_API_KEY: "${LAYA_API_KEY:?Set LAYA_API_KEY in .env}"
+      LAYA_DEFAULT_MODEL: "${LAYA_DEFAULT_MODEL:-english}"
+      LAYA_JEV_STRICT: "${LAYA_JEV_STRICT:-1}"
+      LAYA_PRELOAD: "${LAYA_PRELOAD:-0}"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
+    ports:
+      # why: bound to loopback so the server is not exposed to the LAN.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - model-cache:/home/laya/.cache/huggingface
+    init: true
+    restart: unless-stopped
+
+volumes:
+  model-cache:
