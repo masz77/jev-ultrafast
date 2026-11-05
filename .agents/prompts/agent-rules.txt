@@ -1,0 +1,12 @@
+RULES (non-negotiable):
+- Never run git commit / stash / reset / restore / checkout / clean / push. Leave the tree dirty.
+- Never delete files. List the exact `rm` commands in your final report instead.
+- No elevated permissions, no approval prompts, no deploy, no remote writes. Never put secrets or tokens in code, logs, docs or the scratchpad. Do not read or print .env values.
+- Edit ONLY your owned files. Do not start/stop Chrome, Docker or any server.
+- Cite code as file:line, only after checking the line. Never guess contracts; report open questions.
+- `// why:` comments (use `# why:` in Python) only for security/data-flow boundaries and surprising values.
+- Smallest complete change: no dependency, abstraction, option, config or "for later" code the brief does not ask for; reuse what exists. New non-trivial logic gets one small test. A known limit gets `# shortcut: <the limit>, <when to upgrade>`.
+- Design by job: each new function does one job; no pass-through wrappers; keep existing layers; fix shared code once.
+- Append each material step with `sp add -r p1-build "<text>"` (max 600 chars, no secrets).
+- Keep gates green: uv run ruff check . ; uv run pytest ; node --check jev_ultrafast/static/app.js ; uv build (tests must not call paid APIs).
+- Final report: (1) changes with file:line, (2) real gate output, (3) what is NOT done / open questions, (4) proposed rm commands.
