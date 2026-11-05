@@ -12,5 +12,6 @@ Read README.md before editing. Keep the loop small: page -> indexed elements -> 
 - Verify actual final outcomes independently. A DONE choice is not proof of success.
 - Keep examples, README claims, raw evidence, and model-call counts consistent.
 - Do not commit or push unless the user requests it.
+- Decisions: read docs/DECISIONS.md before you change a limit or a stop rule. Record a change there and in sp (-r decision); cite the ID in the `why:` comment.
 
 Checks: uv run ruff check ., uv run pytest, node --check jev_ultrafast/static/app.js, uv build.

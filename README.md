@@ -95,7 +95,7 @@ Measured on an 8-CPU Docker VM on a Mac, CPU only.
 - `TYPE_TEXT` still needs a separate text LLM (`TEXT_MODEL_API_KEY`). Laya cannot write field values.
 
 **Agent behavior**
-- The 60-step loop never retries a browser mutation, so a bad early choice can fail the whole run.
+- The 360-step loop never retries a browser mutation, so a bad early choice can fail the whole run.
 - In a one-button test the agent clicked correctly but never chose `DONE`. It clicked the same button 4 times and ended `blocked`.
 - Use idempotent or read-only flows until you have measured Laya on your own pages.
 
