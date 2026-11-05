@@ -33,7 +33,10 @@ def main():
                 )
                 (output / "state.json").write_text(json.dumps(state, indent=2))
                 if len(history) >= args.max_actions:
-                    raise RuntimeError(f"Diagnostic stopped at {args.max_actions} actions")
+                    raise RuntimeError(
+                        f"Diagnostic stopped at {args.max_actions} actions. "
+                        "Raise --max-actions, or narrow --goal; see state.json history for loops."
+                    )
         finally:
             state = agent.snapshot()
             try:

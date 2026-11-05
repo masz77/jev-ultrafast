@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,18 +18,35 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def viewport_size():
+    """Return (width, height) from JEV_VIEWPORT=WIDTHxHEIGHT, default 1120x780."""
+    raw = os.environ.get("JEV_VIEWPORT")
+    if not raw:
+        return 1120, 780
+    try:
+        width, height = map(int, raw.lower().split("x"))
+    except ValueError:
+        raise ValueError(f"JEV_VIEWPORT must be WIDTHxHEIGHT, for example 1280x2000; got {raw!r}") from None
+    if width <= 0 or height <= 0:
+        raise ValueError(f"JEV_VIEWPORT must be positive; got {raw!r}")
+    return width, height
+
+
 class Browser:
     def __init__(self, url):
+        width, height = viewport_size()  # Parse before creating a tab, so a bad value leaks nothing.
         ensure_daemon()
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        self.call("Emulation.setDeviceMetricsOverride", width=width, height=height, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
+        self.loaded = False  # The agent tells the model when the first page may be incomplete.
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":
+                self.loaded = True
                 break
             time.sleep(0.02)
 
@@ -36,24 +54,26 @@ class Browser:
         return cdp(method, session_id=self.session, **params)
 
     def evaluate(self, expression):
-        response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+        # why: awaitPromise lets an async success check resolve; without it a fetch() promise returns {}.
+        response = self.call("Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=True)
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        settled = None
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
             try:
-                self.call(
+                settled = self.call(
                     "Runtime.evaluate",
                     expression="""(action => new Promise(resolve => {
                       const field=window.__jevFast?.nodes.get(action.node);
                       const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
                       let frames=0, stopped=false;
-                      const finish=()=>{stopped=true;resolve()};
-                      setTimeout(finish,autocomplete ? 200 : 50);
+                      const finish=ok=>{stopped=true;resolve(ok)};
+                      setTimeout(()=>finish(false),autocomplete ? 200 : 50);
                       const ready=()=>{
                         if (stopped) return;
                         const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
@@ -64,26 +84,25 @@ class Browser:
                           const r=e.getBoundingClientRect();
                           return r.width && r.height && r.bottom>0 && r.top<innerHeight &&
                             e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
-                        }))) finish();
+                        }))) finish(true);
                         else requestAnimationFrame(ready);
                       };
                       requestAnimationFrame(ready);
                     }))(""" + json.dumps(action) + ")",
                     awaitPromise=True,
                     returnByValue=True,
-                )
+                ).get("result", {}).get("value")
             except RuntimeError:
                 pass
         for attempt in range(10):
             try:
-                return browser_operation(
-                    {"operation": "observe", "session": self.session, "screenshot": screenshot}
-                )
+                page = browser_operation({"operation": "observe", "session": self.session, "screenshot": screenshot})
+                page["settled"] = settled  # False: the settle wait timed out, so the page may still change.
+                return page
             except StalePage:
                 if attempt == 9:
-                    raise
+                    raise StalePage("Page did not settle after 10 observations.") from None
                 time.sleep(0.02)
-        raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select"}:

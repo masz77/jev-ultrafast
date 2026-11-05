@@ -84,9 +84,13 @@ function render() {
     ready: "Page observed · ready for a decision",
     predicted: "Choice ready · inspect or execute",
     done: "Jev reports complete · inspect the page",
-    blocked: "Stopped · no supported next action",
+    blocked: "Stopped · see the reason below",
   };
   $("status").textContent = labels[state.status] || state.status;
+  if (state.status === "blocked" && state.blocked_reason) {
+    $("error").textContent = `${state.next_step === "retry" ? "Retry" : "Adjust"}: ${state.blocked_reason}`;
+    $("error").hidden = false;
+  }
   if (!page) {
     controls();
     return;

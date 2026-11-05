@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from jev_ultrafast import agent as loop
+from jev_ultrafast import browser as browser_mod
 from jev_ultrafast import model
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
@@ -162,6 +163,7 @@ def runner():
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
+    a.success_check = None
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -174,6 +176,8 @@ def runner():
         "started_at": time.perf_counter(),
         "record": False,
         "text_calls": [],
+        "done_rejections": 0,
+        "done_reject": None,
     }
     return a
 
@@ -310,6 +314,302 @@ def test_text_helper_rejects_invalid_values(monkeypatch, content):
     monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
     with pytest.raises(ValueError, match="nothing typed"):
         model.field_text({"goal": "Find a flight"})
+
+
+def blocked_decision(operation_probabilities):
+    return {
+        "choice": "BLOCKED",
+        "operation": "BLOCKED",
+        "target": None,
+        "confidence": 0.9,
+        "probabilities": {"BLOCKED": 0.9},
+        "operation_probabilities": operation_probabilities,
+        "latency_ms": 10,
+        "usage": {},
+    }
+
+
+def test_blocked_scrolls_when_more_page_is_below(runner):
+    p = runner.state["page"]
+    p["actions"].insert(-1, {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560})
+    runner.state["decision"] = blocked_decision({"BLOCKED": 0.9, "CLICK": 0.1})
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "scroll_down"
+    assert runner.state["status"] == "ready"
+    assert runner.state["history"][-1]["operation"] == "BLOCKED->SCROLL_DOWN"
+    assert runner.state["history"][-1]["probability"] == 0.9
+
+
+def test_blocked_without_scroll_stops_with_reason(runner):
+    runner.state["decision"] = blocked_decision({"BLOCKED": 0.8, "CLICK": 0.15, "WAIT": 0.05})
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "blocked"
+    assert "4 observed actions" in runner.state["blocked_reason"]
+    assert "BLOCKED 0.80" in runner.state["blocked_reason"]
+
+
+def test_no_progress_rule_sets_reason(runner):
+    for _ in range(3):
+        runner.state["decision"] = decision("e3")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert "unchanged" in runner.state["blocked_reason"]
+    assert "Loop:" in runner.state["blocked_reason"]  # same target 3x is named for the caller
+
+
+def done_decision():
+    return {**decision(), "choice": "DONE", "operation": "DONE"}
+
+
+def test_done_rejected_by_success_check_is_retold_to_the_model(runner):
+    runner.success_check = "window.ok === true"
+    runner.state["browser"].evaluate.return_value = False
+    runner.state["goal"] = "Find a book"
+    runner.state["decision"] = done_decision()
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].evaluate.assert_called_once_with("window.ok === true")
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] != "done"
+    assert any("DONE rejected" in note for note in runner.notes())
+
+
+def test_done_accepted_when_success_check_is_true(runner):
+    runner.success_check = "true"
+    runner.state["browser"].evaluate.return_value = True
+    runner.state["decision"] = done_decision()
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+
+
+def test_write_goal_without_fill_or_select_rejects_done(runner):
+    runner.state["goal"] = "Add a project"
+    runner.state["history"] = [{"kind": "click", "action": "Go", "page_changed": True}]
+    runner.state["decision"] = done_decision()
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert any("DONE rejected" in note for note in runner.notes())
+
+
+def test_write_goal_with_a_fill_accepts_done(runner):
+    runner.state["goal"] = "Add a project"
+    runner.state["history"] = [
+        {"kind": "fill", "action": "Name", "page_changed": True},
+        {"kind": "click", "action": "Go", "page_changed": True},
+    ]
+    runner.state["decision"] = done_decision()
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done"
+
+
+def test_three_rejected_dones_stop_for_an_adjusted_goal(runner):
+    runner.success_check = "false"
+    runner.state["browser"].evaluate.return_value = False
+    for _ in range(3):
+        runner.state["decision"] = done_decision()
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "blocked" and runner.state["next_step"] == "adjust"
+    assert "DONE was rejected 3 times" in runner.state["blocked_reason"]
+
+
+def test_three_same_labels_stop_even_when_the_page_changes(runner):
+    runner.state["browser"].observe.side_effect = [dict(page(), fingerprint=f"after-{i}") for i in range(3)]
+    for _ in range(3):
+        runner.state["decision"] = decision("e3")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert [h["page_changed"] for h in runner.state["history"]] == [True, True, True]
+    assert runner.state["status"] == "blocked" and runner.state["next_step"] == "adjust"
+    assert "ran three times" in runner.state["blocked_reason"]
+
+
+def test_three_scrolls_with_changing_page_are_progress(runner):
+    scroll = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560}
+
+    def scrolled(i):
+        p = dict(page(), fingerprint=f"after-{i}", actions=[*page()["actions"][:-1], scroll, page()["actions"][-1]])
+        return p
+
+    runner.state["browser"].observe.side_effect = [scrolled(i) for i in range(3)]
+    runner.state["page"] = scrolled("start")
+    for _ in range(3):
+        runner.state["decision"] = decision("scroll_down")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert [h["kind"] for h in runner.state["history"]] == ["scroll"] * 3
+
+
+def test_success_check_error_is_a_rejection(runner):
+    runner.success_check = "slow()"
+    runner.state["browser"].evaluate.side_effect = TimeoutError("IPC response timed out")
+    runner.state["decision"] = done_decision()
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert any("DONE rejected" in note and "timed out" in note for note in runner.notes())
+
+
+def test_three_different_labels_with_changing_page_keep_going(runner, monkeypatch):
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("x", {"model": "stub", "latency_ms": 1})))
+    runner.state["browser"].observe.side_effect = [dict(page(), fingerprint=f"after-{i}") for i in range(3)]
+    for choice_id in ["e1", "e2", "e3"]:
+        runner.state["decision"] = decision(choice_id)
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+
+
+def test_evaluate_waits_for_promises(monkeypatch):
+    cdp = Mock(return_value={"result": {"value": True}})
+    monkeypatch.setattr(browser_mod, "cdp", cdp)
+    b = browser_mod.Browser.__new__(browser_mod.Browser)
+    b.session = "s"
+    assert b.evaluate("fetch('/x').then(r => r.ok)") is True
+    assert cdp.call_args.kwargs["awaitPromise"] is True
+
+
+def test_step_budget_is_a_soft_stop_with_advice(runner, monkeypatch):
+    monkeypatch.setattr(loop, "MAX_STEPS", 1)
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["browser"].act.assert_called_once()  # The second choice is never executed.
+    assert runner.state["status"] == "blocked" and runner.state["next_step"] == "adjust"
+    assert "1-action budget" in runner.state["blocked_reason"]
+    assert "Last steps:" in runner.state["blocked_reason"] and "Next: adjust" in runner.state["blocked_reason"]
+
+
+
+@pytest.mark.parametrize(
+    ("error", "next_step"),
+    [
+        (model.ModelError("Model provider returned HTTP 503", True), "retry"),
+        (model.ModelError("Model provider returned HTTP 413", False), "adjust"),
+        (RuntimeError("Dropdown execution was interrupted; inspect before retrying."), "adjust"),
+        (model.ModelError("TYPESAFE_API_KEY is not set", False), "adjust"),
+    ],
+)
+def test_tick_turns_failures_into_a_stop_with_next_step(runner, monkeypatch, error, next_step):
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=error))
+    runner.state["status"] = "ready"
+    runner.command("tick")
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "blocked" and runner.state["next_step"] == next_step
+    assert f"Next: {next_step}" in runner.state["blocked_reason"]
+
+
+def test_tick_lets_programming_errors_surface(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=KeyError("typo")))
+    runner.state["status"] = "ready"
+    with pytest.raises(KeyError):
+        runner.command("tick")
+
+
+def test_unobserved_mutation_is_never_marked_retry(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["status"] = "ready"
+    runner.state["browser"].observe.side_effect = StalePage("Page did not settle after 10 observations.")
+    runner.command("tick")
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["history"][-1]["page_changed"] is None
+    assert runner.state["next_step"] == "adjust" and "not observed" in runner.state["blocked_reason"]
+
+
+def test_interrupted_dropdown_is_logged_as_unconfirmed(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["status"] = "ready"
+    runner.state["browser"].act.side_effect = RuntimeError("Dropdown execution was interrupted")
+    runner.command("tick")
+    assert runner.state["history"][-1]["unconfirmed"] is True
+    assert runner.state["next_step"] == "adjust"
+
+
+def test_missing_goal_value_is_not_retryable(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    reply = {"choices": [{"message": {"content": '{"text": null}'}}]}
+    monkeypatch.setattr(model, "post_json", Mock(return_value=reply))
+    with pytest.raises(model.ModelError, match="Add the value") as caught:
+        model.field_text({"goal": "Fill the form"})
+    assert caught.value.retry is False
+
+
+def test_tick_stops_when_the_page_never_settles(runner):
+    runner.state["browser"].fresh.side_effect = StalePage("navigating")
+    runner.state["browser"].observe.side_effect = StalePage("Page did not settle after 10 observations.")
+    runner.command("tick")
+    assert runner.state["next_step"] == "retry" and "did not settle" in runner.state["blocked_reason"]
+
+
+def test_notes_warn_before_hard_limits(runner, monkeypatch):
+    monkeypatch.setattr(loop, "MAX_STEPS", 20)
+    p = runner.state["page"]
+    p.update(omitted_actions=7, text_truncated=True)
+    step = {"action": "Go", "kind": "click", "operation": "CLICK", "page_changed": False}
+    runner.state["history"] = [dict(step) for _ in range(16)]
+    runner.state["history"][-1].update(role="combobox", settled=False)
+    notes = " | ".join(runner.notes())
+    for expected in ("7 more controls", "cut at 6000", "6 earlier actions", "'Go' was chosen 8 times",
+                     "last 2 actions did not change", "No suggestion list", "4 actions left"):
+        assert expected in notes
+    runner.state["history"], p["omitted_actions"], p["text_truncated"] = [], 0, False
+    assert runner.notes() == []
+
+
+def test_notes_reach_the_model_only_when_present(monkeypatch):
+    bodies = []
+
+    def post(url, key, body):
+        bodies.append(body)
+        return {"answers": {"operation": choice(["CLICK", "TYPE_TEXT", "WAIT", "DONE", "BLOCKED"], "DONE")},
+                "model": "test"}
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(page(), "Find a book", [])
+    model.choose(page(), "Find a book", [], ["4 actions left before the run stops."])
+    assert "notes" not in bodies[0]["state"]
+    assert list(bodies[1]["state"])[0] == "notes"  # Laya cuts a dict state from the end.
+    assert bodies[1]["state"]["notes"] == ["4 actions left before the run stops."]
+
+
+@pytest.mark.parametrize(("code", "retry", "hint"), [(413, False, "LAYA_TOURNAMENT_GROUP"), (503, True, "Wait")])
+def test_provider_errors_carry_retry_flag_and_hint(monkeypatch, code, retry, hint):
+    import httpx
+
+    monkeypatch.setattr(model, "CLIENT", Mock(post=Mock(return_value=httpx.Response(code, text="too many"))))
+    monkeypatch.setattr(model.time, "sleep", Mock())
+    with pytest.raises(model.ModelError) as caught:
+        model.post_json("http://laya.test", "key", {})
+    assert caught.value.retry is retry and hint in str(caught.value) and "too many" in str(caught.value)
+
+
+def test_text_helper_names_token_cutoff(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    cut = {"choices": [{"message": {"content": '{"text": "Zur'}, "finish_reason": "length"}]}
+    monkeypatch.setattr(model, "post_json", Mock(return_value=cut))
+    with pytest.raises(model.ModelError, match="cut at 1024 tokens"):
+        model.field_text({"goal": "Find a flight"})
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1280x2000", (1280, 2000)), (None, (1120, 780))],
+)
+def test_viewport_env_parses_size(monkeypatch, value, expected):
+    import jev_ultrafast.browser as browser
+
+    if value is None:
+        monkeypatch.delenv("JEV_VIEWPORT", raising=False)
+    else:
+        monkeypatch.setenv("JEV_VIEWPORT", value)
+    assert browser.viewport_size() == expected
+
+
+def test_viewport_env_rejects_bad_value(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    monkeypatch.setenv("JEV_VIEWPORT", "bad")
+    with pytest.raises(ValueError, match="JEV_VIEWPORT must be WIDTHxHEIGHT"):
+        browser.viewport_size()
 
 
 def test_navigation_during_prediction_reobserves_without_action(runner):
